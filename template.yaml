@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  URL Shortener API - Proyecto de portafolio AWS (Pablo Cueto Gatica).
+  Arquitectura serverless: API Gateway -> Lambda -> DynamoDB.
+  Mapea a temario AWS Certified Developer - Associate (DVA-C02):
+  Dominio 1 (Lambda, DynamoDB, APIs), Dominio 2 (IAM least-privilege),
+  Dominio 3 (SAM / Infrastructure as Code).
+
+# Globals aplica configuracion por defecto a TODAS las funciones Lambda
+# del proyecto, en vez de repetirla en cada una (buena practica de SAM).
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Runtime: python3.13
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # TABLA DYNAMODB
+  # ---------------------------------------------------------------
+  UrlShortenerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: url-shortener-table
+      BillingMode: PAY_PER_REQUEST  # On-Demand: ideal para portafolio/carga impredecible
+      AttributeDefinitions:
+        - AttributeName: shortcode
+          AttributeType: S
+      KeySchema:
+        - AttributeName: shortcode
+          KeyType: HASH  # Partition Key
+
+  # ---------------------------------------------------------------
+  # FUNCION LAMBDA
+  # ---------------------------------------------------------------
+  UrlShortenerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: url_shortener_function/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          # La Lambda recibe el nombre de la tabla via variable de entorno,
+          # NUNCA hardcodeado en el codigo (Dominio 2.2: configuracion segura).
+          TABLE_NAME: !Ref UrlShortenerTable
+      Policies:
+        # Politica de MINIMO PRIVILEGIO (Dominio 2.1.5/2.1.6): esta Lambda
+        # SOLO puede leer/escribir en ESTA tabla especifica, nada mas.
+        # SAM genera automaticamente un Execution Role con esta policy
+        # adjunta - no usamos AdministratorAccess ni permisos amplios.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UrlShortenerTable
+      Events:
+        CreateShortUrl:
+          Type: Api
+          Properties:
+            Path: /shorten
+            Method: post
+        RedirectShortUrl:
+          Type: Api
+          Properties:
+            Path: /{shortcode}
+            Method: get
+        GetStats:
+          Type: Api
+          Properties:
+            Path: /stats/{shortcode}
+            Method: get
+
+# ---------------------------------------------------------------
+# OUTPUTS: SAM imprime estos valores despues de "sam deploy",
+# muy util para no andar buscando URLs en la consola.
+# ---------------------------------------------------------------
+Outputs:
+  ApiEndpoint:
+    Description: "URL base de la API (API Gateway)"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  UrlShortenerFunctionArn:
+    Description: "ARN de la funcion Lambda"
+    Value: !GetAtt UrlShortenerFunction.Arn
+  UrlShortenerTableName:
+    Description: "Nombre de la tabla DynamoDB"
+    Value: !Ref UrlShortenerTable

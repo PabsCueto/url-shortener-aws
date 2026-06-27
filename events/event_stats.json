@@ -1,0 +1,9 @@
+{
+  "httpMethod": "GET",
+  "resource": "/stats/{shortcode}",
+  "path": "/stats/aZ3kP9",
+  "pathParameters": {
+    "shortcode": "aZ3kP9"
+  },
+  "body": null
+}

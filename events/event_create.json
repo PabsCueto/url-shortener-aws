@@ -1,0 +1,7 @@
+{
+  "httpMethod": "POST",
+  "resource": "/shorten",
+  "path": "/shorten",
+  "pathParameters": null,
+  "body": "{\"url\": \"https://docs.aws.amazon.com/aws-certification/latest/developer-associate-02/\"}"
+}

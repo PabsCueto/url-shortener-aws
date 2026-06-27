@@ -1,0 +1,22 @@
+# SAM
+.aws-sam/
+samconfig.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editores
+.vscode/
+.idea/
+
+# Variables de entorno locales (si las usas para pruebas)
+.env
