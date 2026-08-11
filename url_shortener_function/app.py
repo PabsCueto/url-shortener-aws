@@ -10,6 +10,7 @@ Mapeo a temario AWS Certified Developer - Associate (DVA-C02):
 - Dominio 1.1.6: Crear y mantener APIs (routing manual por método+path)
 - Dominio 1.3: Interactuar con DynamoDB (put_item, get_item, update_item atomico)
 - Dominio 2.2: Configuracion segura via variables de entorno (no hardcoded)
+- Dominio 2: Gestion de secretos con Secrets Manager, autorizacion en capas
 - Dominio 4: Manejo de errores y logging para troubleshooting
 """
 
@@ -25,6 +26,7 @@ from botocore.exceptions import ClientError
 # --- Configuracion via variables de entorno (Dominio 2.2) ---
 # Nunca hardcodear el nombre de la tabla: se inyecta desde template.yaml
 TABLE_NAME = os.environ["TABLE_NAME"]
+ADMIN_SECRET_ARN = os.environ["ADMIN_SECRET_ARN"]
 
 # El cliente de DynamoDB se inicializa FUERA del handler.
 # Esto es una buena practica de Lambda (Dominio 1.1): la conexion se
@@ -32,6 +34,15 @@ TABLE_NAME = os.environ["TABLE_NAME"]
 # recrearse en cada llamada.
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
+
+# Cliente de Secrets Manager (Dominio 2: gestion de secretos).
+# Igual que el cliente de DynamoDB, se inicializa fuera del handler.
+secrets_client = boto3.client("secretsmanager")
+
+# Cache en memoria del token admin: evita llamar a Secrets Manager
+# en CADA invocacion (ahorra costo y latencia). Se llena una sola vez
+# por contenedor Lambda "caliente" y se reutiliza mientras siga tibio.
+_cached_admin_token = None
 
 ALPHABET = string.ascii_letters + string.digits
 
@@ -56,6 +67,16 @@ def _response(status_code: int, body: dict, extra_headers: dict | None = None) -
     }
 
 
+def _get_admin_token() -> str:
+    """Obtiene el token admin desde Secrets Manager, cacheado en memoria."""
+    global _cached_admin_token
+    if _cached_admin_token is None:
+        response = secrets_client.get_secret_value(SecretId=ADMIN_SECRET_ARN)
+        secret_dict = json.loads(response["SecretString"])
+        _cached_admin_token = secret_dict["token"]
+    return _cached_admin_token
+
+
 def _create_short_url(event: dict) -> dict:
     """POST /shorten - crea un nuevo shortcode para una URL larga."""
     try:
@@ -67,12 +88,9 @@ def _create_short_url(event: dict) -> dict:
     if not original_url:
         return _response(400, {"error": "El campo 'url' es requerido"})
 
-    # Generamos shortcode y verificamos colision (poco probable, pero correcto)
     for _ in range(5):
         shortcode = _generate_shortcode()
         try:
-            # condition_expression evita sobre-escribir un shortcode existente
-            # (Dominio 1.3: operaciones condicionales en DynamoDB)
             table.put_item(
                 Item={
                     "shortcode": shortcode,
@@ -88,7 +106,7 @@ def _create_short_url(event: dict) -> dict:
             })
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                continue  # colision rara, reintenta con otro shortcode
+                continue
             raise
 
     return _response(500, {"error": "No se pudo generar un shortcode unico"})
@@ -102,9 +120,6 @@ def _redirect(shortcode: str) -> dict:
     if not item:
         return _response(404, {"error": "Shortcode no encontrado"})
 
-    # Incremento ATOMICO del contador (Dominio 1.3): se hace en una sola
-    # operacion update_item, sin leer-modificar-escribir, para evitar
-    # condiciones de carrera si varios usuarios hacen clic al mismo tiempo.
     table.update_item(
         Key={"shortcode": shortcode},
         UpdateExpression="SET click_count = click_count + :inc",
@@ -130,6 +145,31 @@ def _get_stats(shortcode: str) -> dict:
     })
 
 
+def _delete_shortcode(event: dict, shortcode: str) -> dict:
+    """
+    DELETE /admin/{shortcode} - elimina un shortcode.
+
+    Segunda capa de seguridad (ademas del API Key de API Gateway):
+    requiere el header 'x-admin-token' con el valor guardado en
+    Secrets Manager. Esto separa "quien puede llamar a la API"
+    (API Key, capa de infraestructura) de "quien puede ejecutar
+    esta accion especifica" (token admin, capa de aplicacion) -
+    Dominio 2: control de acceso en capas.
+    """
+    headers = event.get("headers") or {}
+    provided_token = headers.get("x-admin-token") or headers.get("X-Admin-Token")
+
+    if not provided_token or provided_token != _get_admin_token():
+        return _response(401, {"error": "Token de administrador invalido o ausente"})
+
+    result = table.get_item(Key={"shortcode": shortcode})
+    if "Item" not in result:
+        return _response(404, {"error": "Shortcode no encontrado"})
+
+    table.delete_item(Key={"shortcode": shortcode})
+    return _response(200, {"message": f"Shortcode '{shortcode}' eliminado correctamente"})
+
+
 def lambda_handler(event: dict, context) -> dict:
     """
     Punto de entrada de la Lambda.
@@ -150,14 +190,14 @@ def lambda_handler(event: dict, context) -> dict:
         if http_method == "GET" and resource == "/stats/{shortcode}":
             return _get_stats(path_params.get("shortcode", ""))
 
+        if http_method == "DELETE" and resource == "/admin/{shortcode}":
+            return _delete_shortcode(event, path_params.get("shortcode", ""))
+
         if http_method == "GET" and resource == "/{shortcode}":
             return _redirect(path_params.get("shortcode", ""))
 
         return _response(404, {"error": "Ruta no encontrada"})
 
     except Exception as exc:
-        # Logging para CloudWatch (Dominio 4: troubleshooting).
-        # Lo que se imprime con print() en Lambda aparece automaticamente
-        # en CloudWatch Logs.
         print(f"ERROR no controlado: {exc}")
         return _response(500, {"error": "Error interno del servidor"})
