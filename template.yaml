@@ -4,24 +4,21 @@ Description: >
   URL Shortener API - Proyecto de portafolio AWS (Pablo Cueto Gatica).
   Arquitectura serverless: API Gateway -> Lambda -> DynamoDB.
   Fase 2: seguridad con API Gateway API Key + Secrets Manager.
-  Fase 4: observabilidad - logging estructurado, X-Ray, CloudWatch Alarms.
+  Fase 4: observabilidad - logging estructurado, X-Ray, CloudWatch Alarms + SNS.
   Mapea a temario AWS Certified Developer - Associate (DVA-C02):
   Dominio 1 (Lambda, DynamoDB, APIs), Dominio 2 (IAM least-privilege,
   API Keys, Secrets Manager), Dominio 3 (SAM / Infrastructure as Code),
-  Dominio 4 (observabilidad y troubleshooting: X-Ray, CloudWatch).
+  Dominio 4 (observabilidad y troubleshooting: X-Ray, CloudWatch Alarms).
 
 Globals:
   Function:
     Timeout: 10
     MemorySize: 128
     Runtime: python3.13
-    Tracing: Active   # Fase 4 (Dominio 4): habilita X-Ray en la Lambda.
-                       # SAM agrega automaticamente el permiso IAM
-                       # xray:PutTraceSegments al rol de ejecucion.
+    Tracing: Active
   Api:
-    TracingEnabled: true   # Fase 4: habilita X-Ray en el stage de API
-                            # Gateway para que el trace incluya el salto
-                            # API Gateway -> Lambda, no solo la Lambda sola.
+    Name: url-shortener-aws-api
+    TracingEnabled: true
 
 Resources:
   UrlShortenerTable:
@@ -126,6 +123,119 @@ Resources:
       KeyType: API_KEY
       UsagePlanId: !Ref ApiUsagePlan
 
+  # ---------------------------------------------------------------
+  # OBSERVABILIDAD - CLOUDWATCH ALARMS + SNS (Fase 4 - Dominio 4)
+  # ---------------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: url-shortener-alerts
+
+  # Sin esta politica, CloudWatch no tiene permiso para publicar en el
+  # topico (a diferencia de crear la alarma desde la consola, que la
+  # agrega automaticamente). Dominio 2: permiso explicito y minimo.
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: cheffcueto@gmail.com
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: url-shortener-lambda-errors
+      AlarmDescription: "1 o mas errores (excepciones no controladas) en la Lambda en 5 min"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UrlShortenerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: url-shortener-lambda-duration
+      AlarmDescription: "Duracion promedio >= 8s (el timeout configurado es 10s)"
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UrlShortenerFunction
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 8000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: url-shortener-lambda-throttles
+      AlarmDescription: "Lambda esta siendo throttled (limite de concurrencia alcanzado)"
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UrlShortenerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: url-shortener-api-5xx
+      AlarmDescription: "API Gateway devolvio 1 o mas errores 5xx en 5 min"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: url-shortener-aws-api
+        - Name: Stage
+          Value: Prod
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
 Outputs:
   ApiEndpoint:
     Description: "URL base de la API (API Gateway)"
@@ -142,3 +252,6 @@ Outputs:
   AdminSecretArn:
     Description: "ARN del secreto admin"
     Value: !Ref AdminTokenSecret
+  AlertsTopicArn:
+    Description: "ARN del topico SNS de alertas (CloudWatch Alarms)"
+    Value: !Ref AlertsTopic
