@@ -4,20 +4,26 @@ Description: >
   URL Shortener API - Proyecto de portafolio AWS (Pablo Cueto Gatica).
   Arquitectura serverless: API Gateway -> Lambda -> DynamoDB.
   Fase 2: seguridad con API Gateway API Key + Secrets Manager.
+  Fase 4: observabilidad - logging estructurado, X-Ray, CloudWatch Alarms.
   Mapea a temario AWS Certified Developer - Associate (DVA-C02):
   Dominio 1 (Lambda, DynamoDB, APIs), Dominio 2 (IAM least-privilege,
-  API Keys, Secrets Manager), Dominio 3 (SAM / Infrastructure as Code).
+  API Keys, Secrets Manager), Dominio 3 (SAM / Infrastructure as Code),
+  Dominio 4 (observabilidad y troubleshooting: X-Ray, CloudWatch).
 
 Globals:
   Function:
     Timeout: 10
     MemorySize: 128
     Runtime: python3.13
+    Tracing: Active   # Fase 4 (Dominio 4): habilita X-Ray en la Lambda.
+                       # SAM agrega automaticamente el permiso IAM
+                       # xray:PutTraceSegments al rol de ejecucion.
+  Api:
+    TracingEnabled: true   # Fase 4: habilita X-Ray en el stage de API
+                            # Gateway para que el trace incluya el salto
+                            # API Gateway -> Lambda, no solo la Lambda sola.
 
 Resources:
-  # ---------------------------------------------------------------
-  # TABLA DYNAMODB
-  # ---------------------------------------------------------------
   UrlShortenerTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -30,9 +36,6 @@ Resources:
         - AttributeName: shortcode
           KeyType: HASH
 
-  # ---------------------------------------------------------------
-  # SECRETO: token de administrador (Fase 2 - Secrets Manager)
-  # ---------------------------------------------------------------
   AdminTokenSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -44,9 +47,6 @@ Resources:
         PasswordLength: 32
         ExcludePunctuation: true
 
-  # ---------------------------------------------------------------
-  # FUNCION LAMBDA
-  # ---------------------------------------------------------------
   UrlShortenerFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -77,7 +77,6 @@ Resources:
           Properties:
             Path: /{shortcode}
             Method: get
-            # Publico a proposito: es el endpoint que usan los usuarios finales al hacer click
         GetStats:
           Type: Api
           Properties:
@@ -93,9 +92,6 @@ Resources:
             Auth:
               ApiKeyRequired: true
 
-  # ---------------------------------------------------------------
-  # API KEY + USAGE PLAN (Fase 2 - seguridad de API Gateway)
-  # ---------------------------------------------------------------
   ApiUsagePlan:
     Type: AWS::ApiGateway::UsagePlan
     DependsOn:

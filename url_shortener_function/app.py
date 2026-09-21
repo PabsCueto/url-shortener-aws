@@ -11,7 +11,7 @@ Mapeo a temario AWS Certified Developer - Associate (DVA-C02):
 - Dominio 1.3: Interactuar con DynamoDB (put_item, get_item, update_item atomico)
 - Dominio 2.2: Configuracion segura via variables de entorno (no hardcoded)
 - Dominio 2: Gestion de secretos con Secrets Manager, autorizacion en capas
-- Dominio 4: Logging ESTRUCTURADO para troubleshooting (Fase 4)
+- Dominio 4: Observabilidad - logging estructurado y X-Ray tracing (Fase 4)
 """
 
 import json
@@ -23,6 +23,13 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from aws_xray_sdk.core import patch_all, xray_recorder
+
+# patch_all() intercepta las llamadas de boto3 (y otras librerias soportadas)
+# para crear subsegmentos de X-Ray automaticamente, SIN tocar el codigo de
+# cada llamada. Debe correr una sola vez, al cargar el modulo (cold start),
+# antes de que se hagan llamadas reales - por eso va aqui arriba.
+patch_all()
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 ADMIN_SECRET_ARN = os.environ["ADMIN_SECRET_ARN"]
@@ -37,25 +44,8 @@ _cached_admin_token = None
 ALPHABET = string.ascii_letters + string.digits
 
 
-# ---------------------------------------------------------------
-# LOGGING ESTRUCTURADO (Fase 4 - Dominio 4)
-# ---------------------------------------------------------------
 def _log(level: str, message: str, request_id: str = "", **extra) -> None:
-    """
-    Emite una linea de log en formato JSON a stdout.
-
-    Lambda envia todo lo impreso a stdout hacia CloudWatch Logs
-    automaticamente - no hace falta ningun cliente ni libreria extra.
-    "Logging estructurado" significa que cada linea es un objeto JSON
-    valido en vez de texto libre, lo que permite correr consultas de
-    CloudWatch Logs Insights como:
-
-        fields @timestamp, level, message, shortcode
-        | filter level = "ERROR"
-        | sort @timestamp desc
-
-    en vez de hacer grep manual sobre texto sin estructura.
-    """
+    """Emite una linea de log en formato JSON a stdout (ver Fase 4, paso 1)."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "level": level,
@@ -104,30 +94,42 @@ def _create_short_url(event: dict, request_id: str) -> dict:
         _log("WARNING", "Falta el campo 'url' en /shorten", request_id=request_id)
         return _response(400, {"error": "El campo 'url' es requerido"})
 
-    for _ in range(5):
-        shortcode = _generate_shortcode()
-        try:
-            table.put_item(
-                Item={
+    # Subsegmento MANUAL de X-Ray (Dominio 4): patch_all() ya traza las
+    # llamadas individuales a boto3 (cada put_item), pero aqui agrupamos
+    # todo el bloque "generar shortcode unico" (que puede reintentar
+    # varias veces) bajo un subsegmento propio, con nombre legible, en
+    # vez de ver llamadas sueltas a DynamoDB sin contexto de negocio.
+    with xray_recorder.capture("generate_unique_shortcode"):
+        for _ in range(5):
+            shortcode = _generate_shortcode()
+            try:
+                table.put_item(
+                    Item={
+                        "shortcode": shortcode,
+                        "original_url": original_url,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "click_count": 0,
+                    },
+                    ConditionExpression="attribute_not_exists(shortcode)",
+                )
+                # Annotation: queda INDEXADO, se puede filtrar en la consola
+                # de X-Ray (ej. annotation.shortcode = "meRfLo") o via API
+                # (get_trace_summaries con FilterExpression). El "metadata"
+                # (a diferencia de las annotations) NO se indexa, solo sirve
+                # para inspeccionar el detalle de un trace ya encontrado.
+                xray_recorder.current_subsegment().put_annotation("shortcode", shortcode)
+                _log("INFO", "Shortcode creado", request_id=request_id,
+                     shortcode=shortcode, event_type="url_created")
+                return _response(201, {
                     "shortcode": shortcode,
                     "original_url": original_url,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "click_count": 0,
-                },
-                ConditionExpression="attribute_not_exists(shortcode)",
-            )
-            _log("INFO", "Shortcode creado", request_id=request_id,
-                 shortcode=shortcode, event_type="url_created")
-            return _response(201, {
-                "shortcode": shortcode,
-                "original_url": original_url,
-            })
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                _log("WARNING", "Colision de shortcode, reintentando",
-                     request_id=request_id, shortcode=shortcode)
-                continue
-            raise
+                })
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    _log("WARNING", "Colision de shortcode, reintentando",
+                         request_id=request_id, shortcode=shortcode)
+                    continue
+                raise
 
     _log("ERROR", "No se pudo generar un shortcode unico tras 5 intentos",
          request_id=request_id)
